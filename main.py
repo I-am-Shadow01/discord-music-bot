@@ -1,14 +1,16 @@
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import yt_dlp
 import asyncio
 import random
+import time
+import os
 from collections import deque
 from dotenv import load_dotenv
-import os
 
 load_dotenv()
+
 # ===== BOT SETUP =====
 intents = discord.Intents.default()
 intents.message_content = True
@@ -28,10 +30,11 @@ class GuildState:
     def __init__(self):
         self.queue: deque = deque()
         self.now_playing: dict = None
-        self.loop_mode: str = "off"   # off | one | all
+        self.loop_mode: str = "off"
         self.volume: float = 0.5
-        self.control_message: discord.Message = None
-        self.control_channel: discord.TextChannel = None
+        self.start_time: float = None
+        self.panel_message: discord.Message = None
+        self.panel_channel_id: int = None   # channel ที่ /setup ไว้
 
 states: dict[int, GuildState] = {}
 
@@ -47,6 +50,13 @@ def format_duration(seconds):
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+def build_progress_bar(elapsed: int, total: int, length: int = 22) -> str:
+    if not total:
+        return "🔴 LIVE"
+    filled = min(int(length * elapsed / total), length)
+    bar = "─" * filled + "⬤" + "─" * (length - filled)
+    return f"`{bar}`"
 
 def extract_info(query: str) -> list:
     opts = {
@@ -68,35 +78,40 @@ FFMPEG_OPTIONS = {
     'options': '-vn'
 }
 
-# ===== CONTROL EMBED =====
-def build_control_embed(state: GuildState) -> discord.Embed:
+# ===== PANEL EMBED =====
+def build_panel_embed(state: GuildState) -> discord.Embed:
     track = state.now_playing
-    queue_len = len(state.queue)
 
     if not track:
         e = discord.Embed(
-            title="🎵 Music Player",
-            description="```\nไม่มีเพลงที่กำลังเล่น\n```",
+            title="🎵 ห้องเล่นเพลง | Music Room",
+            description='วางลิ้งค์หรือชื่อเพลงในช่องนี้เพื่อเพิ่มเข้า queue\nหรือใช้คำสั่ง `/play`',
             color=0x2B2D31
         )
-        e.add_field(name="Status", value="⏹️ Stopped", inline=True)
-        e.add_field(name="Queue", value="0 เพลง", inline=True)
-        e.add_field(name="Volume", value=f"{int(state.volume*100)}%", inline=True)
-        e.set_footer(text="ใช้ /play เพื่อเริ่มเล่นเพลง")
+        e.add_field(name="⚡ สถานะ", value="ขณะนี้ไม่มีเพลงที่กำลังเล่นอยู่", inline=False)
+        e.set_footer(text="[/] Powered by Kaniva Music Bot")
         return e
 
+    elapsed = int(time.time() - state.start_time) if state.start_time else 0
+    total = track.get('duration') or 0
+    elapsed = min(elapsed, total) if total else elapsed
+
+    progress = build_progress_bar(elapsed, total)
+    time_str = f"`{format_duration(elapsed)} / {format_duration(total)}`"
     loop_icons = {"off": "➡️ Off", "one": "🔂 One", "all": "🔁 All"}
+    queue_len = len(state.queue)
 
     e = discord.Embed(
-        title="🎵 Music Player",
+        title="🎵 ห้องเล่นเพลง | Music Room",
         description=f"### [{track['title']}]({track['webpage_url']})",
         color=0x1DB954
     )
-    e.add_field(name="⏱️ ความยาว", value=format_duration(track['duration']), inline=True)
+    e.add_field(name="\u200b", value=f"{progress}\n{time_str}", inline=False)
+    e.add_field(name="⏱ ความยาว", value=format_duration(total), inline=True)
     e.add_field(name="🔊 Volume", value=f"{int(state.volume*100)}%", inline=True)
     e.add_field(name="🔁 Loop", value=loop_icons[state.loop_mode], inline=True)
-    e.add_field(name="📋 Queue", value=f"{queue_len} เพลงถัดไป", inline=True)
-    e.add_field(name="👤 ขอโดย", value=track['requester'], inline=True)
+    e.add_field(name="👤 ขอโดย", value=f"@{track['requester']}", inline=True)
+    e.add_field(name="📋 Queue", value=f"{queue_len} Songs", inline=True)
 
     if queue_len > 0:
         next_tracks = list(state.queue)[:3]
@@ -106,38 +121,46 @@ def build_control_embed(state: GuildState) -> discord.Embed:
         e.add_field(name="⏭️ ถัดไป", value=next_lines, inline=False)
 
     if track.get('thumbnail'):
-        e.set_thumbnail(url=track['thumbnail'])
+        e.set_image(url=track['thumbnail'])
 
-    e.set_footer(text="🎶 Kaniva Music Bot")
+    e.set_footer(text="[/] Powered by Kaniva Music Bot")
     return e
 
-# ===== CONTROL VIEW (Buttons) =====
-class ControlView(discord.ui.View):
+# ===== PANEL VIEW =====
+class PanelView(discord.ui.View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=None)
         self.guild_id = guild_id
-        # sync loop button label ให้ตรงกับ state ปัจจุบัน
         state = get_state(guild_id)
-        labels = {"off": ("➡️", "Loop: Off"), "one": ("🔂", "Loop: One"), "all": ("🔁", "Loop: All")}
+        # sync loop button
+        loop_labels = {"off": ("➡️", "Loop: Off"), "one": ("🔂", "Loop: One"), "all": ("🔁", "Loop: All")}
         for item in self.children:
-            if isinstance(item, discord.ui.Button) and item.custom_id == f"loop_btn_{guild_id}":
-                item.emoji = discord.PartialEmoji(name=labels[state.loop_mode][0])
-                item.label = labels[state.loop_mode][1]
+            if isinstance(item, discord.ui.Button) and item.custom_id == "loop_btn":
+                item.emoji = loop_labels[state.loop_mode][0]
+                item.label = loop_labels[state.loop_mode][1]
+        # ถ้าไม่มีเพลง ซ่อนปุ่มที่ไม่จำเป็น
+        if not state.now_playing:
+            for item in self.children:
+                if isinstance(item, discord.ui.Button) and item.custom_id in ("pause_resume", "skip_btn", "stop_btn", "shuffle_btn", "vol_down", "vol_up", "loop_btn", "queue_btn"):
+                    item.disabled = True
 
-    def get_vc(self, interaction: discord.Interaction):
-        return interaction.guild.voice_client
-
-    async def refresh(self, interaction: discord.Interaction):
+    async def refresh(self, interaction: discord.Interaction = None):
         state = get_state(self.guild_id)
+        # re-enable/disable ปุ่มตาม state
+        has_track = state.now_playing is not None
+        for item in self.children:
+            if isinstance(item, discord.ui.Button) and item.custom_id in ("pause_resume", "skip_btn", "stop_btn", "shuffle_btn", "vol_down", "vol_up", "loop_btn", "queue_btn"):
+                item.disabled = not has_track
         try:
-            await state.control_message.edit(embed=build_control_embed(state), view=self)
+            if state.panel_message:
+                await state.panel_message.edit(embed=build_panel_embed(state), view=self)
         except Exception:
             pass
 
     @discord.ui.button(emoji="⏸️", label="Pause", style=discord.ButtonStyle.secondary, custom_id="pause_resume", row=0)
     async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        vc = self.get_vc(interaction)
+        vc = interaction.guild.voice_client
         if not vc:
             return
         if vc.is_playing():
@@ -148,12 +171,12 @@ class ControlView(discord.ui.View):
             vc.resume()
             button.emoji = "⏸️"
             button.label = "Pause"
-        await self.refresh(interaction)
+        await self.refresh()
 
     @discord.ui.button(emoji="⏭️", label="Skip", style=discord.ButtonStyle.primary, custom_id="skip_btn", row=0)
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        vc = self.get_vc(interaction)
+        vc = interaction.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
             vc.stop()
 
@@ -161,13 +184,14 @@ class ControlView(discord.ui.View):
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         state = get_state(self.guild_id)
-        vc = self.get_vc(interaction)
+        vc = interaction.guild.voice_client
         if vc:
             state.queue.clear()
             state.now_playing = None
+            state.start_time = None
             vc.stop()
             await vc.disconnect()
-        await self.refresh(interaction)
+        await self.refresh()
 
     @discord.ui.button(emoji="🔀", label="Shuffle", style=discord.ButtonStyle.secondary, custom_id="shuffle_btn", row=0)
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -177,7 +201,7 @@ class ControlView(discord.ui.View):
             lst = list(state.queue)
             random.shuffle(lst)
             state.queue = deque(lst)
-        await self.refresh(interaction)
+        await self.refresh()
 
     @discord.ui.button(emoji="➡️", label="Loop: Off", style=discord.ButtonStyle.secondary, custom_id="loop_btn", row=1)
     async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -185,31 +209,30 @@ class ControlView(discord.ui.View):
         state = get_state(self.guild_id)
         modes = ["off", "one", "all"]
         labels = {"off": ("➡️", "Loop: Off"), "one": ("🔂", "Loop: One"), "all": ("🔁", "Loop: All")}
-        idx = (modes.index(state.loop_mode) + 1) % len(modes)
-        state.loop_mode = modes[idx]
+        state.loop_mode = modes[(modes.index(state.loop_mode) + 1) % len(modes)]
         button.emoji = labels[state.loop_mode][0]
         button.label = labels[state.loop_mode][1]
-        await self.refresh(interaction)
+        await self.refresh()
 
     @discord.ui.button(emoji="🔉", label="Vol -10%", style=discord.ButtonStyle.secondary, custom_id="vol_down", row=1)
     async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         state = get_state(self.guild_id)
         state.volume = max(0.0, round(state.volume - 0.1, 1))
-        vc = self.get_vc(interaction)
+        vc = interaction.guild.voice_client
         if vc and vc.source:
             vc.source.volume = state.volume
-        await self.refresh(interaction)
+        await self.refresh()
 
     @discord.ui.button(emoji="🔊", label="Vol +10%", style=discord.ButtonStyle.secondary, custom_id="vol_up", row=1)
     async def vol_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         state = get_state(self.guild_id)
         state.volume = min(2.0, round(state.volume + 0.1, 1))
-        vc = self.get_vc(interaction)
+        vc = interaction.guild.voice_client
         if vc and vc.source:
             vc.source.volume = state.volume
-        await self.refresh(interaction)
+        await self.refresh()
 
     @discord.ui.button(emoji="📋", label="Queue", style=discord.ButtonStyle.secondary, custom_id="queue_btn", row=1)
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -236,10 +259,11 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient):
         state.now_playing = track
     else:
         state.now_playing = None
-        if state.control_message:
-            view = ControlView(guild.id)
+        state.start_time = None
+        view = PanelView(guild.id)
+        if state.panel_message:
             try:
-                await state.control_message.edit(embed=build_control_embed(state), view=view)
+                await state.panel_message.edit(embed=build_panel_embed(state), view=view)
             except Exception:
                 pass
         return
@@ -254,25 +278,126 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient):
             asyncio.run_coroutine_threadsafe(play_next(guild, vc), bot.loop)
 
         vc.play(source, after=after)
+        state.start_time = time.time()
 
-        if state.control_message:
-            view = ControlView(guild.id)
+        view = PanelView(guild.id)
+        if state.panel_message:
             try:
-                await state.control_message.edit(embed=build_control_embed(state), view=view)
+                await state.panel_message.edit(embed=build_panel_embed(state), view=view)
             except Exception:
                 pass
 
     except Exception as e:
-        print(f"Error playing track: {e}")
+        print(f"Error playing: {e}")
         await play_next(guild, vc)
 
-# ===== SLASH COMMANDS =====
+# ===== BACKGROUND: อัปเดต progress bar =====
+@tasks.loop(seconds=5)
+async def update_panel_task():
+    for guild_id, state in states.items():
+        if state.panel_message and state.now_playing:
+            try:
+                view = PanelView(guild_id)
+                await state.panel_message.edit(embed=build_panel_embed(state), view=view)
+            except Exception:
+                pass
+
+@update_panel_task.before_loop
+async def before_update():
+    await bot.wait_until_ready()
+
+# ===== AUTO-QUEUE: รับ URL/ชื่อเพลงในช่องที่ setup =====
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    state = get_state(message.guild.id) if message.guild else None
+
+    if state and message.channel.id == state.panel_channel_id:
+        query = message.content.strip()
+        if query:
+            # ลบ message ของ user
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            if not message.author.voice:
+                err = await message.channel.send(f"❌ {message.author.mention} เข้า voice channel ก่อนนะ!", delete_after=5)
+                return
+
+            vc = message.guild.voice_client
+            if vc is None:
+                vc = await message.author.voice.channel.connect()
+            elif vc.channel != message.author.voice.channel:
+                await vc.move_to(message.author.voice.channel)
+
+            loading = await message.channel.send(f"🔍 กำลังหา: `{query[:50]}`", delete_after=10)
+
+            loop = asyncio.get_event_loop()
+            try:
+                tracks = await loop.run_in_executor(None, extract_info, query)
+            except Exception as e:
+                await message.channel.send(f"❌ Error: {e}", delete_after=8)
+                return
+
+            for t in tracks:
+                state.queue.append({
+                    'title': t.get('title', 'Unknown'),
+                    'url': t.get('url') or t.get('webpage_url'),
+                    'duration': t.get('duration'),
+                    'webpage_url': t.get('webpage_url', ''),
+                    'thumbnail': t.get('thumbnail', ''),
+                    'requester': message.author.display_name,
+                })
+
+            if not vc.is_playing() and not vc.is_paused():
+                await play_next(message.guild, vc)
+            else:
+                view = PanelView(message.guild.id)
+                if state.panel_message:
+                    try:
+                        await state.panel_message.edit(embed=build_panel_embed(state), view=view)
+                    except Exception:
+                        pass
+
+        return  # ไม่ process commands ในช่องนี้
+
+    await bot.process_commands(message)
+
+# ===== EVENTS =====
 @bot.event
 async def on_ready():
+    update_panel_task.start()
     print(f"✅ Bot ready: {bot.user}")
 
+# ===== SLASH COMMANDS =====
+@bot.tree.command(name="setup", description="ตั้ง music panel ในช่องที่เลือก")
+@app_commands.describe(channel="channel ที่จะใช้เป็น music room")
+async def setup_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+    state = get_state(interaction.guild_id)
+
+    # ลบ panel เก่า
+    if state.panel_message:
+        try:
+            await state.panel_message.delete()
+        except Exception:
+            pass
+
+    state.panel_channel_id = channel.id
+
+    view = PanelView(interaction.guild_id)
+    panel_msg = await channel.send(embed=build_panel_embed(state), view=view)
+    state.panel_message = panel_msg
+
+    await interaction.response.send_message(
+        f"✅ ตั้ง music room ที่ {channel.mention} แล้ว\nวางลิ้งค์หรือชื่อเพลงในช่องนั้นเพื่อเพิ่มเข้า queue ได้เลย",
+        ephemeral=True
+    )
+
 @bot.tree.command(name="play", description="เล่นเพลงหรือเพิ่มเข้า queue")
-@app_commands.describe(query="ชื่อเพลงหรือ URL (YouTube, playlist ได้)")
+@app_commands.describe(query="ชื่อเพลงหรือ URL")
 async def play(interaction: discord.Interaction, query: str):
     if not interaction.user.voice:
         return await interaction.response.send_message("❌ เข้า voice channel ก่อนนะ!", ephemeral=True)
@@ -308,26 +433,12 @@ async def play(interaction: discord.Interaction, query: str):
 
     if not vc.is_playing() and not vc.is_paused():
         await play_next(interaction.guild, vc)
-    elif state.control_message:
-        view = ControlView(interaction.guild_id)
+    elif state.panel_message:
+        view = PanelView(interaction.guild_id)
         try:
-            await state.control_message.edit(embed=build_control_embed(state), view=view)
+            await state.panel_message.edit(embed=build_panel_embed(state), view=view)
         except Exception:
             pass
-
-@bot.tree.command(name="setup", description="ตั้ง music control panel สำหรับ server นี้")
-async def player_cmd(interaction: discord.Interaction):
-    state = get_state(interaction.guild_id)
-    if state.control_message:
-        try:
-            await state.control_message.delete()
-        except Exception:
-            pass
-
-    view = ControlView(interaction.guild_id)
-    await interaction.response.send_message(embed=build_control_embed(state), view=view)
-    state.control_message = await interaction.original_response()
-    state.control_channel = interaction.channel
 
 @bot.tree.command(name="skip", description="ข้ามเพลงปัจจุบัน")
 async def skip(interaction: discord.Interaction):
@@ -345,13 +456,14 @@ async def stop(interaction: discord.Interaction):
     if vc:
         state.queue.clear()
         state.now_playing = None
+        state.start_time = None
         vc.stop()
         await vc.disconnect()
     await interaction.response.send_message("⏹️ หยุดแล้ว", ephemeral=True)
-    if state.control_message:
-        view = ControlView(interaction.guild_id)
+    if state.panel_message:
+        view = PanelView(interaction.guild_id)
         try:
-            await state.control_message.edit(embed=build_control_embed(state), view=view)
+            await state.panel_message.edit(embed=build_panel_embed(state), view=view)
         except Exception:
             pass
 
@@ -366,10 +478,9 @@ async def volume(interaction: discord.Interaction, vol: int):
     if vc and vc.source:
         vc.source.volume = state.volume
     await interaction.response.send_message(f"🔊 Volume: {vol}%", ephemeral=True)
-    if state.control_message:
-        view = ControlView(interaction.guild_id)
+    if state.panel_message:
         try:
-            await state.control_message.edit(embed=build_control_embed(state), view=view)
+            await state.panel_message.edit(embed=build_panel_embed(state), view=PanelView(interaction.guild_id))
         except Exception:
             pass
 
@@ -385,10 +496,9 @@ async def loop_cmd(interaction: discord.Interaction, mode: str):
     state.loop_mode = mode
     icons = {"off": "➡️", "one": "🔂", "all": "🔁"}
     await interaction.response.send_message(f"{icons[mode]} Loop: **{mode}**", ephemeral=True)
-    if state.control_message:
-        view = ControlView(interaction.guild_id)
+    if state.panel_message:
         try:
-            await state.control_message.edit(embed=build_control_embed(state), view=view)
+            await state.panel_message.edit(embed=build_panel_embed(state), view=PanelView(interaction.guild_id))
         except Exception:
             pass
 
@@ -401,10 +511,9 @@ async def shuffle(interaction: discord.Interaction):
     random.shuffle(lst)
     state.queue = deque(lst)
     await interaction.response.send_message(f"🔀 สุ่ม {len(lst)} เพลงแล้ว", ephemeral=True)
-    if state.control_message:
-        view = ControlView(interaction.guild_id)
+    if state.panel_message:
         try:
-            await state.control_message.edit(embed=build_control_embed(state), view=view)
+            await state.panel_message.edit(embed=build_panel_embed(state), view=PanelView(interaction.guild_id))
         except Exception:
             pass
 
@@ -435,10 +544,9 @@ async def remove(interaction: discord.Interaction, position: int):
     removed = q.pop(position - 1)
     state.queue = deque(q)
     await interaction.response.send_message(f"🗑️ ลบ **{removed['title']}** แล้ว", ephemeral=True)
-    if state.control_message:
-        view = ControlView(interaction.guild_id)
+    if state.panel_message:
         try:
-            await state.control_message.edit(embed=build_control_embed(state), view=view)
+            await state.panel_message.edit(embed=build_panel_embed(state), view=PanelView(interaction.guild_id))
         except Exception:
             pass
 
@@ -447,10 +555,9 @@ async def clear(interaction: discord.Interaction):
     state = get_state(interaction.guild_id)
     state.queue.clear()
     await interaction.response.send_message("🗑️ ล้าง Queue แล้ว", ephemeral=True)
-    if state.control_message:
-        view = ControlView(interaction.guild_id)
+    if state.panel_message:
         try:
-            await state.control_message.edit(embed=build_control_embed(state), view=view)
+            await state.panel_message.edit(embed=build_panel_embed(state), view=PanelView(interaction.guild_id))
         except Exception:
             pass
 
