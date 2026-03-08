@@ -1,4 +1,4 @@
-# 🎵 Kaniva Music Bot
+# Discord Music Bot
 
 Discord music bot using discord.py + yt-dlp
 
